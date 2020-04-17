@@ -1,0 +1,392 @@
+# import Automatic Differentiation
+# You may use Neural Network Framework, but only for building MLPs
+# i.e. no fancy probabilistic implementations
+using Flux
+using MLDatasets
+using Statistics
+using Logging
+using Test
+using Random
+using StatsFuns: log1pexp
+Random.seed!(412414);
+
+#### Probability Stuff
+# Make sure you test these against a standard implementation!
+
+# log-pdf of x under Factorized or Diagonal Gaussian N(x|μ,σI)
+function factorized_gaussian_log_density(mu, logsig,xs)
+  """
+  mu and logsig either same size as x in batch or same as whole batch
+  returns a 1 x batchsize array of likelihoods
+  """
+  σ = exp.(logsig)
+  return sum((-1/2)*log.(2π*σ.^2) .+ -1/2 * ((xs .- mu).^2)./(σ.^2),dims=1)
+end
+
+# log-pdf of x under Bernoulli
+function bernoulli_log_density(logit_means,x)
+  """Numerically stable log_likelihood under bernoulli by accepting μ/(1-μ)"""
+  b = x .* 2 .- 1 # {0,1} -> {-1,1}
+  return - log1pexp.(-b .* logit_means)
+end
+## This is really bernoulli
+@testset "test stable bernoulli" begin
+  using Distributions
+  x = rand(10,100) .> 0.5
+  μ = rand(10)
+  logit_μ = log.(μ./(1 .- μ))
+  @test logpdf.(Bernoulli.(μ),x) ≈ bernoulli_log_density(logit_μ,x)
+  # over i.i.d. batch
+  @test sum(logpdf.(Bernoulli.(μ),x),dims=1) ≈ sum(bernoulli_log_density(logit_μ,x),dims=1)
+end
+
+# sample from Diagonal Gaussian x~N(μ,σI) (hint: use reparameterization trick here)
+sample_diag_gaussian(μ,logσ) = (ϵ = randn(size(μ)); μ .+ exp.(logσ).*ϵ)
+# sample from Bernoulli (this can just be supplied by library)
+sample_bernoulli(θ) = rand.(Bernoulli.(θ))
+
+# Load MNIST data, binarise it, split into train and test sets (10000 each) and partition train into mini-batches of M=100.
+# You may use the utilities from A2, or dataloaders provided by a framework
+function load_binarized_mnist(train_size=10000, test_size=10000)
+  train_x, train_label = MNIST.traindata(1:train_size);
+  test_x, test_label = MNIST.testdata(1:test_size);
+  @info "Loaded MNIST digits with dimensionality $(size(train_x))"
+  train_x = reshape(train_x, 28*28,:)
+  test_x = reshape(test_x, 28*28,:)
+  @info "Reshaped MNIST digits to vectors, dimensionality $(size(train_x))"
+  train_x = train_x .> 0.5; #binarize
+  test_x = test_x .> 0.5; #binarize
+  @info "Binarized the pixels"
+  return (train_x, train_label), (test_x, test_label)
+end
+
+function batch_data((x,label)::Tuple, batch_size=100)
+  """
+  Shuffle both data and image and put into batches
+  """
+  N = size(x)[end] # number of examples in set
+  rand_idx = shuffle(1:N) # randomly shuffle batch elements
+  batch_idx = Iterators.partition(rand_idx,batch_size) # split into batches
+  batch_x = [x[:,i] for i in batch_idx]
+  batch_label = [label[i] for i in batch_idx]
+  return zip(batch_x, batch_label)
+end
+# if you only want to batch xs
+batch_x(x::AbstractArray, batch_size=100) = first.(batch_data((x,zeros(size(x)[end])),batch_size))
+
+
+### Implementing the model
+
+## Load the Data
+train_data, test_data = load_binarized_mnist();
+train_x, train_label = train_data;
+test_x, test_label = test_data;
+
+## Test the dimensions of loaded data
+@testset "correct dimensions" begin
+@test size(train_x) == (784,10000)
+@test size(train_label) == (10000,)
+@test size(test_x) == (784,10000)
+@test size(test_label) == (10000,)
+end
+
+## Model Dimensionality
+# #### Set up model according to Appendix C (using Bernoulli decoder for Binarized MNIST)
+# Set latent dimensionality=2 and number of hidden units=500.
+Dz, Dh = 2, 500
+Ddata = 28^2
+
+# ## Generative Model
+# This will require implementing a simple MLP neural network
+# See example_flux_model.jl for inspiration
+# Further, you should read the Basics section of the Flux.jl documentation
+# https://fluxml.ai/Flux.jl/stable/models/basics/
+# that goes over the simple functions you will use.
+# You will see that there's nothing magical going on inside these neural network libraries
+# and when you implemented a neural network in previous assignments you did most of the work.
+# If you want more information about how to use the functions from Flux, you can always reference
+# the internal docs for each function by typing `?` into the REPL:
+# ? Chain
+# ? Dense
+decoder = Chain(Dense(Dz, Dh, tanh), Dense(Dh, Ddata)) #TODO
+
+## Model Distributions
+log_prior(z) = factorized_gaussian_log_density(0, 0, z)
+
+function log_likelihood(x,z)
+  """ Compute log likelihood log_p(x|z)"""
+  θ = decoder(z)
+  return bernoulli_log_density(θ, x)
+end
+
+joint_log_density(x,z) = sum(log_likelihood(x, z), dims = 1) + log_prior(z)#TODO
+
+## Amortized Inference
+function unpack_gaussian_params(θ)
+  μ, logσ = θ[1:2,:], θ[3:end,:]
+  return  μ, logσ
+end
+
+encoder = Chain(Dense(Ddata, Dh, tanh), Dense(Dh, 2*Dz), unpack_gaussian_params)#TODO
+# Hint: last "layer" in Chain can be 'unpack_gaussian_params'
+
+
+log_q(q_μ, q_logσ, z) =  factorized_gaussian_log_density(q_μ, q_logσ, z)#TODO: write log likelihood under variational distribution.
+
+function elbo(x)
+  q_μ, q_logσ = encoder(x) #TODO variational parameters from data
+  z = sample_diag_gaussian(q_μ, q_logσ) #TODO: sample from variational distribution
+  joint_ll = joint_log_density(x, z)#TODO: joint likelihood of z and x under model
+  log_q_z = log_q(q_μ, q_logσ, z)#TODO: likelihood of z under variational distribution
+  elbo_estimate =  mean(joint_ll-log_q_z)#TODO: Scalar value, mean variational evidence lower bound over batch
+  return elbo_estimate
+end
+
+function loss(x)
+  return -elbo(x) #TODO: scalar value for the variational loss over elements in the batch
+end
+
+# Training with gradient optimization:
+# See example_flux_model.jl for inspiration
+
+function train_model_params!(loss, encoder, decoder, train_x, test_x; nepochs=10)
+  # model params
+  ps = Flux.params(encoder, decoder)#TODO parameters to update with gradient descent
+  # ADAM optimizer with default parameters
+  opt = ADAM()
+  # over batches of the data
+  for i in 1:nepochs
+    for d in batch_x(train_x)
+      gs = Flux.gradient(ps) do # compute gradients with respect to variational loss over batch
+        batch_loss = loss(d)
+      end
+      #TODO update the paramters with gradients
+      Flux.Optimise.update!(opt, ps, gs)
+    end
+    if i%1 == 0 # change 1 to higher number to compute and print less frequently
+      @info "Test loss at epoch $i: $(loss(batch_x(test_x)[1]))"
+    end
+  end
+  @info "Parameters of encoder and decoder trained!"
+end
+
+
+## Train the model
+train_model_params!(loss,encoder,decoder,train_x,test_x, nepochs=100)
+
+### Save the trained model!
+using BSON:@save
+cd(@__DIR__)
+@info "Changed directory to $(@__DIR__)"
+save_dir = "trained_models"
+if !(isdir(save_dir))
+  mkdir(save_dir)
+  @info "Created save directory $save_dir"
+end
+@save joinpath(save_dir,"encoder_params.bson") encoder
+@save joinpath(save_dir,"decoder_params.bson") decoder
+@info "Saved model params in $save_dir"
+
+
+
+## Load the trained model!
+using BSON:@load
+cd(@__DIR__)
+@info "Changed directory to $(@__DIR__)"
+load_dir = "trained_models"
+@load joinpath(load_dir,"encoder_params.bson") encoder
+@load joinpath(load_dir,"decoder_params.bson") decoder
+@info "Load model params from $load_dir"
+
+
+
+
+# Visualization
+using Images
+using Plots
+# make vector of digits into images, works on batches also
+mnist_img(x) = ndims(x)==2 ? Gray.(reshape(x,28,28,:))' : Gray.(reshape(x,28,28))'
+
+## Example for how to use mnist_img to plot digit from training data
+plot(mnist_img(train_x[:,1]))
+
+# 3 Plot samples from the trained generative model using ancestral sampling
+
+# a. Sample a z from the prior
+
+z = randn(2, 10)
+decoded = decoder(z)
+ilogit_decoded = exp.(decoded)./(exp.(decoded).+1)
+plot(mnist_img(ilogit_decoded[:,10]))
+bernoulli_sample = sample_bernoulli(ilogit_decoded)
+
+plot_list = Any[]
+
+
+b_1 = plot(mnist_img(ilogit_decoded[:,1]))
+b_2 = plot(mnist_img(ilogit_decoded[:,2]))
+b_3 = plot(mnist_img(ilogit_decoded[:,3]))
+b_4 = plot(mnist_img(ilogit_decoded[:,4]))
+b_5 = plot(mnist_img(ilogit_decoded[:,5]))
+b_6 = plot(mnist_img(ilogit_decoded[:,6]))
+b_7 = plot(mnist_img(ilogit_decoded[:,7]))
+b_8 = plot(mnist_img(ilogit_decoded[:,8]))
+b_9 = plot(mnist_img(ilogit_decoded[:,9]))
+b_10 = plot(mnist_img(ilogit_decoded[:,10]))
+c_1 = plot(mnist_img(bernoulli_sample[:,1]))
+c_2 = plot(mnist_img(bernoulli_sample[:,2]))
+c_3 = plot(mnist_img(bernoulli_sample[:,3]))
+c_4 = plot(mnist_img(bernoulli_sample[:,4]))
+c_5 = plot(mnist_img(bernoulli_sample[:,5]))
+c_6 = plot(mnist_img(bernoulli_sample[:,6]))
+c_7 = plot(mnist_img(bernoulli_sample[:,7]))
+c_8 = plot(mnist_img(bernoulli_sample[:,8]))
+c_9 = plot(mnist_img(bernoulli_sample[:,9]))
+c_10= plot(mnist_img(bernoulli_sample[:,10]))
+plot_list = [b_1, b_2, b_3, b_4, b_5, b_6, b_7, b_8, b_9, b_10, c_1, c_2, c_3, c_4, c_5, c_6, c_7, c_8, c_9, c_10]
+display(plot(plot_list..., layout = grid(2, 10), size = (2000, 1000), axis = nothing))
+
+
+
+# b.
+q_μ, q_logσ= encoder(train_x)
+scatter(q_μ[1,:], q_μ[2,:], group= train_label)
+
+# c.
+# (a) Write a function to interpolate
+function interpolate(z_a, z_b, α)
+  return z_a = α.*z_a .+ (1 - α).*z_b
+end
+
+
+steps = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]/10
+elem_1 = train_x[:,1]
+elem_2 = train_x[:,2]
+μ1_1, sig1_1 = encoder(elem_1)
+μ1_2, sig1_2= encoder(elem_2)
+
+plot_1 = Any[]
+for i in steps
+  z = interpolate(μ1_1, μ1_2, i)
+  decoded = decoder(z)
+  μ = vec(exp.(decoded)./(exp.(decoded).+1))
+  push!(plot_1, plot(mnist_img(μ)))
+end
+
+
+steps = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]/10
+elem_1 = train_x[:,3]
+elem_2 = train_x[:,4]
+μ1_1, sig1_1 = encoder(elem_1)
+μ1_2, sig1_2= encoder(elem_2)
+
+plot_2 = Any[]
+for i in steps
+  z = interpolate(μ1_1, μ1_2, i)
+  decoded = decoder(z)
+  μ = vec(exp.(decoded)./(exp.(decoded).+1))
+  push!(plot_2, plot(mnist_img(μ)))
+end
+
+steps = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]/10
+elem_1 = train_x[:,5]
+elem_2 = train_x[:,6]
+μ1_1, sig1_1 = encoder(elem_1)
+μ1_2, sig1_2= encoder(elem_2)
+
+plot_3 = Any[]
+for i in steps
+  z = interpolate(μ1_1, μ1_2, i)
+  decoded = decoder(z)
+  μ = vec(exp.(decoded)./(exp.(decoded).+1))
+  push!(plot_3, plot(mnist_img(μ)))
+end
+total_plot = vcat(plot_1, plot_2, plot_3)
+
+# Display the Interpolation Results
+display(plot(total_plot..., layout = grid(3, 10), size = (2000, 1000), axis = nothing))
+
+
+#4 Predicting the Bottom of Images given the Top
+#(a)
+function top_half(x)
+  return x[1:392,:]
+end
+
+function llp_top_give_z(x, z)
+  θ = top_half(decoder(z))
+  likelihoods = sum(bernoulli_log_density(θ, top_half(x)), dims = 1)
+  return likelihoods
+end
+
+function log_top_joint(x, z)
+  return log_prior(z) + llp_top_give_z(x, z)
+end
+
+
+# (b)
+function top_elbo(params, x, num_samples)
+  q_μ, q_logσ = params
+  zs = exp.(q_logσ) .*  randn(length(q_μ), num_samples) .+ q_μ
+  joint_ll = log_top_joint(x, zs)
+  log_q_z= log_q(q_μ, q_logσ, zs)
+  elbo_estimate = mean(joint_ll -log_q_z)
+  return elbo_estimate
+end
+
+
+function neg_top_elbo(params,x ;num_sample = 10)
+  return -top_elbo(params, x, num_sample)
+end
+
+function optimize_phi(init_param, x; iter = 200, lr = 1e-2, num_sample = 50)
+  params_cur = collect(init_param)
+  for i in 1:iter
+    grad_params = gradient((param)-> neg_top_elbo(param, x, num_sample=num_sample), params_cur)[1]
+    params_cur[1] = params_cur[1] - lr * grad_params[1]
+    params_cur[2] = params_cur[2] - lr * grad_params[2]
+    elbo = -neg_top_elbo(params_cur, x)
+    @info "Elbo at iter $i: $(elbo)"
+  end
+  return params_cur
+end
+
+
+function skillcontour!(f; colour=nothing)
+  n = 100
+  x = range(-3,stop=2,length=n)
+  y = range(-3,stop=2,length=n)
+  z_grid = Iterators.product(x,y) # meshgrid for contour
+  z_grid = reshape.(collect.(z_grid),:,1) # add single batch dim
+  z = f.(z_grid)
+  z = getindex.(z,1)'
+  max_z = maximum(z)
+  levels = [.99, 0.9, 0.8, 0.7,0.6,0.5, 0.4, 0.3, 0.2] .* max_z
+  if colour==nothing
+  p1 = contour!(x, y, z, fill=false, levels=levels)
+  else
+  p1 = contour!(x, y, z, fill=false, c=colour,levels=levels,colorbar=false)
+  end
+  plot!(p1)
+end
+
+choice = 3
+init_mu = randn(Dz)
+init_log_sigma = randn(Dz)/100
+init_params = (init_mu, init_log_sigma)
+optim_param = optimize_phi(init_params, train_x[:,choice])
+decoded = decoder(optim_param[1])
+μ = vec(exp.(decoded)./(exp.(decoded).+1))
+orig_upper = train_x[:,choice][1:392]
+post_lower = μ[393:end, :1]
+post_whole = [orig_upper; post_lower]
+post = plot(mnist_img(post_whole), title = "True Upper and Estiated Lower", axis = nothing)
+org = plot(mnist_img(train_x[:, choice]), title = "Original", axis = nothing)
+all = [post, org]
+plot(all...)
+
+plot(xlabel = "Z1", ylabel = "Z2", title = "True Isocontour (Red) vs. Estimated Posterior Isocontour (Blue)")
+log_estp(zs) = exp(log_top_joint(train_x[:, choice], zs))
+skillcontour!(log_estp, colour =:red)
+log_estq(zs) = exp(factorized_gaussian_log_density(optim_param[1], optim_param[2], zs))
+skillcontour!(log_estq, colour =:blue)
